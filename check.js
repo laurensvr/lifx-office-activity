@@ -1,6 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -12,12 +13,14 @@ await loadDotenv(join(SCRIPT_DIR, '.env'));
 const TOKEN = required('LIFX_TOKEN');
 const IP = required('MACBOOK_IP');
 const SELECTOR = process.env.LIFX_SELECTOR ?? 'all';
-const DIM_THRESHOLD = parseInt(process.env.DIM_THRESHOLD ?? '2', 10);
-const OFF_THRESHOLD = parseInt(process.env.OFF_THRESHOLD ?? '5', 10);
+const PING_INTERVAL_S = parseFloat(process.env.PING_INTERVAL_S ?? '3');
 const PING_TIMEOUT_S = parseInt(process.env.PING_TIMEOUT_S ?? '1', 10);
+const DIM_AFTER_S = parseInt(process.env.DIM_AFTER_S ?? '120', 10);
+const OFF_AFTER_S = parseInt(process.env.OFF_AFTER_S ?? '300', 10);
 const DIM_BRIGHTNESS = parseFloat(process.env.DIM_BRIGHTNESS ?? '0.15');
 const FULL_BRIGHTNESS = parseFloat(process.env.FULL_BRIGHTNESS ?? '1.0');
 const STATE_PATH = process.env.STATE_PATH ?? join(SCRIPT_DIR, 'state.json');
+const ONCE = process.argv.includes('--once');
 
 const MODES = {
   on: { power: 'on', brightness: FULL_BRIGHTNESS },
@@ -25,36 +28,56 @@ const MODES = {
   off: { power: 'off' },
 };
 
-const reachable = await pingOnce(IP, PING_TIMEOUT_S);
-const state = await readState(STATE_PATH);
-const consecutiveMisses = reachable ? 0 : (state.consecutiveMisses ?? 0) + 1;
-
-let desired;
-if (reachable) {
-  desired = 'on';
-} else if (consecutiveMisses >= OFF_THRESHOLD) {
-  desired = 'off';
-} else if (consecutiveMisses >= DIM_THRESHOLD) {
-  desired = 'dim';
-} else {
-  desired = state.lastMode ?? 'on';
+let state = await readState(STATE_PATH);
+let running = true;
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => { running = false; });
 }
 
-const transition = desired !== state.lastMode;
-if (transition) {
-  await setLifxState(SELECTOR, TOKEN, MODES[desired]);
+log(`startup: ping=${IP} every ${PING_INTERVAL_S}s, dim after ${DIM_AFTER_S}s, off after ${OFF_AFTER_S}s`);
+
+while (running) {
+  try {
+    await tick();
+  } catch (err) {
+    log(`tick failed: ${err.message}`);
+  }
+  if (ONCE) break;
+  await sleep(PING_INTERVAL_S * 1000);
 }
 
-await writeState(STATE_PATH, {
-  lastMode: desired,
-  consecutiveMisses,
-  lastCheck: new Date().toISOString(),
-  lastReachable: reachable,
-});
+async function tick() {
+  const now = Date.now();
+  const reachable = await pingOnce(IP, PING_TIMEOUT_S);
 
-const stamp = new Date().toISOString();
-const note = transition ? `lights -> ${desired}` : `lights=${desired} (no change)`;
-console.log(`[${stamp}] macbook=${reachable ? 'up' : `down(${consecutiveMisses})`} ${note}`);
+  const lastReachableAt = reachable ? now : (state.lastReachableAt ?? now);
+  const secondsDown = reachable ? 0 : (now - lastReachableAt) / 1000;
+
+  let desired;
+  if (reachable) {
+    desired = 'on';
+  } else if (secondsDown >= OFF_AFTER_S) {
+    desired = 'off';
+  } else if (secondsDown >= DIM_AFTER_S) {
+    desired = 'dim';
+  } else {
+    desired = state.lastMode ?? 'on';
+  }
+
+  const transition = desired !== state.lastMode;
+  if (transition) {
+    await setLifxState(SELECTOR, TOKEN, MODES[desired]);
+    log(`macbook=${reachable ? 'up' : `down(${Math.round(secondsDown)}s)`} lights -> ${desired}`);
+  }
+
+  state = {
+    lastMode: desired,
+    lastReachable: reachable,
+    lastReachableAt,
+    lastCheck: new Date(now).toISOString(),
+  };
+  await writeState(STATE_PATH, state);
+}
 
 async function pingOnce(ip, timeoutSec) {
   try {
@@ -121,4 +144,8 @@ function required(name) {
     process.exit(1);
   }
   return v;
+}
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
 }
