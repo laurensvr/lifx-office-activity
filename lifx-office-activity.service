@@ -1,0 +1,10 @@
+[Unit]
+Description=LIFX office activity check (MacBook presence -> lights on/off)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/lifx-office-activity
+ExecStart=/usr/bin/env node %h/lifx-office-activity/check.js
+Nice=10
